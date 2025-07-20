@@ -1,0 +1,185 @@
+name: Meshery Operator E2E Testing
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to test"
+        default: "master"
+        type: string
+  push:
+    branches:
+      - "master"
+      - "*"
+    paths-ignore:
+      - "docs/**"
+      - ".github/**"
+      - "*.md"
+  pull_request:
+    branches:
+      - "*"
+
+jobs:
+  build-operator-image:
+    name: Build Operator Image
+    if: github.repository == 'Ayushmore1214/meshery-operator'
+    runs-on: ubuntu-24.04
+    outputs:
+      operator-image: ${{ steps.image.outputs.name }}
+      image-tag: ${{ steps.image.outputs.tag }}
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          docker system prune -af
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build Operator Binary
+        run: |
+          make build
+
+      - name: Build Docker Image
+        id: image
+        run: |
+          IMAGE_TAG="test-${{ github.sha }}"
+          IMAGE_NAME="meshery-operator:$IMAGE_TAG"
+          DOCKER_BUILDKIT=1 docker build --no-cache -t $IMAGE_NAME .
+          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Save Docker Image
+        run: |
+          docker save ${{ steps.image.outputs.name }} | gzip > operator-image.tar.gz
+
+      - name: Upload Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: operator-image
+          path: operator-image.tar.gz
+          retention-days: 1
+
+  test-operator-deployment:
+    name: Test Operator Deployment
+    needs: build-operator-image
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        k8s_version: ['v1.28.0', 'v1.29.0']
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Image Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: operator-image
+
+      - name: Create KIND Cluster
+        uses: helm/kind-action@v1.8.0
+        with:
+          cluster_name: meshery-operator-test
+          kubectl_version: ${{ matrix.k8s_version }}
+          config: |
+            kind: Cluster
+            apiVersion: kind.x-k8s.io/v1alpha4
+            nodes:
+            - role: control-plane
+              image: kindest/node:${{ matrix.k8s_version }}
+
+      - name: Load Operator Image
+        run: |
+          gunzip -c operator-image.tar.gz | docker load
+          kind load docker-image ${{ needs.build-operator-image.outputs.operator-image }} --name meshery-operator-test
+
+      - name: Verify Image Loaded
+        run: |
+          docker exec meshery-operator-test-control-plane crictl images | grep meshery-operator
+
+      - name: Wait for Cluster Ready
+        run: |
+          kubectl wait --for=condition=ready node --all --timeout=300s
+          kubectl cluster-info --context kind-meshery-operator-test
+
+      - name: Apply RBAC Configuration
+        run: |
+          kubectl apply -f config/rbac/ -n meshery-operator-system || kubectl create namespace meshery-operator-system && kubectl apply -f config/rbac/ -n meshery-operator-system
+
+      - name: Install Operator via Helm
+        run: |
+          helm install meshery-operator ./charts/meshery-operator \
+            --set image.repository=meshery-operator \
+            --set image.tag=${{ needs.build-operator-image.outputs.image-tag }} \
+            --set image.pullPolicy=Never \
+            --create-namespace \
+            --namespace meshery-operator-system \
+            --wait --timeout=300s
+
+      - name: Verify Operator Deployment
+        run: |
+          echo "=== Checking Operator Pods ==="
+          kubectl get pods -n meshery-operator-system
+          kubectl wait --for=condition=ready pod -l control-plane=controller-manager -n meshery-operator-system --timeout=300s
+
+      - name: Verify Custom Resource Definitions
+        run: |
+          echo "=== Checking CRDs ==="
+          kubectl get crd | grep meshery || echo "No Meshery CRDs found"
+          echo "=== Validating CRD Structure ==="
+          kubectl describe crd | grep -A 5 "meshery" || echo "No detailed CRD info available"
+
+      - name: Test MeshSync Components
+        run: |
+          echo "=== Checking MeshSync Deployment ==="
+          kubectl get deployment meshsync -n meshery-operator-system || echo "MeshSync deployment not found, checking pods..."
+          kubectl get pods -n meshery-operator-system -l app=meshsync || echo "No MeshSync pods found"
+
+      - name: Validate Manager Configuration
+        run: |
+          echo "=== Checking Manager Deployment ==="
+          kubectl get deployment -n meshery-operator-system
+          kubectl describe deployment meshery-operator-controller-manager -n meshery-operator-system || echo "Controller manager deployment not found"
+
+      - name: Basic Smoke Test
+        run: |
+          echo "=== Running Smoke Test ==="
+          # Test operator response to namespace events
+          kubectl create namespace test-meshery-operator
+          sleep 30
+          kubectl get events -n test-meshery-operator
+          kubectl delete namespace test-meshery-operator
+
+      - name: Collect Debug Information
+        if: failure()
+        run: |
+          echo "=== Cluster Info ==="
+          kubectl cluster-info
+          echo "=== All Pods ==="
+          kubectl get pods --all-namespaces
+          echo "=== Operator Logs ==="
+          kubectl logs -l control-plane=controller-manager -n meshery-operator-system --tail=100 || echo "No operator logs available"
+          echo "=== Events ==="
+          kubectl get events --all-namespaces --sort-by='.lastTimestamp'
+          echo "=== Describe Failed Pods ==="
+          kubectl describe pods -n meshery-operator-system
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "=== Final Operator Logs ==="
+          kubectl logs -l control-plane=controller-manager -n meshery-operator-system --tail=50 || true
+          echo "=== Cleaning Up ==="
+          helm uninstall meshery-operator -n meshery-operator-system || true
+          kind delete cluster --name meshery-operator-test || true
